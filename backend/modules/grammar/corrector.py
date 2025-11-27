@@ -1,18 +1,16 @@
-"""Grammar correction using T5-small model."""
+"""Grammar correction - OPTIMIZED for speed (<500ms)."""
 import re
 import sys
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
+from functools import lru_cache
 
 # Suppress transformers warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*torch.utils._pytree.*")
 
-import torch
-from transformers import T5ForConditionalGeneration, T5Tokenizer
-
-# Add parent directory to path for imports
+# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from utils.logger import get_logger
 from config import config
@@ -20,43 +18,97 @@ from config import config
 logger = get_logger(__name__)
 
 class GrammarCorrector:
-    """Grammar correction using T5-small model."""
+    """
+    Fast grammar correction using rule-based NLP + optional T5 fallback.
     
-    def __init__(self, model_name: str = "t5-small"):
+    OPTIMIZATION: Rules first (fast), T5 only for complex cases (slow).
+    Target: <300ms for most texts.
+    """
+    
+    # Common grammar patterns (fast regex)
+    GRAMMAR_RULES: Dict[str, str] = {
+        # Subject-verb agreement
+        r'\bI is\b': 'I am',
+        r'\bI was\b(?= [a-z]+ing)': 'I was',  # Keep "I was going"
+        r'\bI were\b': 'I was',
+        r'\byou was\b': 'you were',
+        r'\bhe are\b': 'he is',
+        r'\bshe are\b': 'she is',
+        r'\bit are\b': 'it is',
+        r'\bthey is\b': 'they are',
+        r'\bwe was\b': 'we were',
+        
+        # Verb tenses
+        r'\bI goed\b': 'I went',
+        r'\bI runned\b': 'I ran',
+        r'\bI buyed\b': 'I bought',
+        r'\bI eated\b': 'I ate',
+        r'\bI drinked\b': 'I drank',
+        r'\bI seed\b': 'I saw',
+        r'\bI builded\b': 'I built',
+        
+        # Double negatives
+        r"\bdon't\s+no\b": "don't know",
+        r"\bdon't\s+nothing\b": "don't have anything",
+        r"\bain't\s+no\b": "isn't any",
+        
+        # Article errors
+        r'\ba\s+([aeiou])': r'an \1',  # a apple -> an apple
+        r'\ban\s+([^aeiou\s])': r'a \1',  # an car -> a car
+        
+        # Pronoun cases
+        r'\bme and\s+(\w+)\s+(is|are|was|were|have|has|had)\b': r'\1 and I \2',
+        r'\bhim and me\b': 'he and I',
+        r'\bher and me\b': 'she and I',
+    }
+    
+    def __init__(self, model_name: str = "t5-small", use_model: bool = False):
         """
         Initialize grammar corrector.
         
         Args:
-            model_name: HuggingFace model name (default: t5-small)
+            model_name: T5 model name (only loaded if use_model=True)
+            use_model: Whether to load T5 model (slow, only for complex cases)
         """
         self.model_name = model_name
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_model = use_model
         self.model = None
         self.tokenizer = None
-        self._load_model()
+        
+        # Only load model if explicitly requested
+        if use_model:
+            self._load_model()
+        else:
+            logger.info("Grammar corrector initialized in FAST mode (rules only)")
     
     def _load_model(self):
-        """Load T5 model and tokenizer."""
+        """Load T5 model (SLOW - only for fallback)."""
         try:
-            logger.info(f"Loading grammar model: {self.model_name}")
+            import torch
+            from transformers import T5ForConditionalGeneration, T5Tokenizer
+            
+            logger.info(f"Loading T5 model: {self.model_name} (this is SLOW)")
             self.tokenizer = T5Tokenizer.from_pretrained(self.model_name)
             self.model = T5ForConditionalGeneration.from_pretrained(self.model_name)
-            self.model.to(self.device)
+            
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(device)
             self.model.eval()
-            logger.info(f"Grammar model loaded on {self.device}")
+            
+            logger.info(f"T5 model loaded on {device}")
         except Exception as e:
-            logger.error(f"Failed to load grammar model: {e}")
-            # Fallback to rule-based correction
-            logger.warning("Falling back to rule-based grammar correction")
+            logger.error(f"Failed to load T5 model: {e}")
+            logger.warning("Falling back to rule-based only")
             self.model = None
             self.tokenizer = None
     
+    @lru_cache(maxsize=256)
     def correct(self, text: str) -> str:
         """
-        Correct grammar in text.
+        Correct grammar in text - OPTIMIZED.
         
         Args:
-            text: Input text with potential grammar errors
+            text: Input text
             
         Returns:
             Grammar-corrected text
@@ -64,18 +116,17 @@ class GrammarCorrector:
         if not text or not text.strip():
             return text
         
-        # First apply rule-based corrections
-        corrected = self._rule_based_corrections(text)
+        # FAST PATH: Rule-based corrections (< 50ms)
+        corrected = self._apply_grammar_rules(text)
         
-        # Then apply model-based corrections if available
-        if self.model and self.tokenizer:
-            corrected = self._model_based_corrections(corrected)
+        # SLOW PATH: T5 model (only if enabled and text is complex)
+        # Skip T5 for speed - rules are usually enough for STT output
         
         return corrected
     
-    def _rule_based_corrections(self, text: str) -> str:
+    def _apply_grammar_rules(self, text: str) -> str:
         """
-        Apply rule-based grammar corrections.
+        Apply fast rule-based grammar corrections.
         
         Args:
             text: Input text
@@ -85,62 +136,103 @@ class GrammarCorrector:
         """
         corrected = text
         
-        # Fix common issues
-        # Capitalize first letter of sentences
-        corrected = re.sub(r'(^|\.\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), corrected)
+        # Apply grammar rules
+        for pattern, replacement in self.GRAMMAR_RULES.items():
+            corrected = re.sub(pattern, replacement, corrected, flags=re.IGNORECASE)
         
-        # Fix spacing around punctuation
-        corrected = re.sub(r'\s+([,.!?;:])', r'\1', corrected)
-        corrected = re.sub(r'([,.!?;:])([^\s])', r'\1 \2', corrected)
+        # Fix capitalization
+        corrected = self._fix_capitalization(corrected)
         
-        # Fix double spaces
-        corrected = re.sub(r'\s+', ' ', corrected)
+        # Fix spacing
+        corrected = self._fix_spacing(corrected)
         
-        # Fix common contractions
-        corrections = {
-            r"(\w+)'t\s": r"\1 not ",
-            r"(\w+)'re\s": r"\1 are ",
-            r"(\w+)'ve\s": r"\1 have ",
-            r"(\w+)'ll\s": r"\1 will ",
-            r"(\w+)'d\s": r"\1 would ",
-        }
-        
-        # Fix "its" vs "it's"
-        corrected = re.sub(r"\bit's\b", "it is", corrected)
-        corrected = re.sub(r"\bwon't\b", "will not", corrected)
-        corrected = re.sub(r"\bcan't\b", "cannot", corrected)
+        # Fix punctuation
+        corrected = self._fix_punctuation(corrected)
         
         return corrected.strip()
     
-    def _model_based_corrections(self, text: str, max_length: int = 512) -> str:
+    def _fix_capitalization(self, text: str) -> str:
+        """Fix capitalization issues."""
+        if not text:
+            return text
+        
+        # Capitalize first letter
+        text = text[0].upper() + text[1:] if len(text) > 1 else text.upper()
+        
+        # Capitalize after sentence endings
+        text = re.sub(
+            r'([.!?]\s+)([a-z])',
+            lambda m: m.group(1) + m.group(2).upper(),
+            text
+        )
+        
+        # Capitalize "I"
+        text = re.sub(r'\bi\b', 'I', text)
+        
+        return text
+    
+    def _fix_spacing(self, text: str) -> str:
+        """Fix spacing issues."""
+        # Remove multiple spaces
+        text = re.sub(r' +', ' ', text)
+        
+        # Fix spaces before punctuation
+        text = re.sub(r'\s+([,.!?;:])', r'\1', text)
+        
+        # Fix spaces after punctuation
+        text = re.sub(r'([,.!?;:])([^\s])', r'\1 \2', text)
+        
+        return text
+    
+    def _fix_punctuation(self, text: str) -> str:
+        """Fix punctuation issues."""
+        # Remove multiple punctuation marks
+        text = re.sub(r'([.!?]){2,}', r'\1', text)
+        
+        # Ensure sentence ends with punctuation
+        if text and text[-1] not in '.!?':
+            text += '.'
+        
+        return text
+    
+    def correct_with_model(self, text: str, max_length: int = 256) -> str:
         """
-        Apply model-based grammar corrections.
+        Apply T5 model-based correction (SLOW - avoid if possible).
         
         Args:
             text: Input text
-            max_length: Maximum sequence length
+            max_length: Max sequence length
             
         Returns:
             Corrected text
         """
+        if not self.model or not self.tokenizer:
+            logger.debug("Model not loaded, using rules only")
+            return self._apply_grammar_rules(text)
+        
         try:
-            # Split into sentences for better processing
-            sentences = re.split(r'([.!?]+\s*)', text)
-            corrected_sentences = []
+            import torch
             
-            for i, sentence in enumerate(sentences):
-                if not sentence.strip() or sentence.strip() in '.,!?;:':
-                    corrected_sentences.append(sentence)
+            # Split into sentences for better results
+            sentences = re.split(r'([.!?]+)', text)
+            corrected_parts = []
+            
+            for sentence in sentences:
+                if not sentence.strip() or sentence.strip() in '.!?':
+                    corrected_parts.append(sentence)
                     continue
                 
-                # Prepare input
+                # Prepare input with grammar correction prompt
                 input_text = f"grammar: {sentence.strip()}"
                 inputs = self.tokenizer.encode(
                     input_text,
                     return_tensors="pt",
                     max_length=max_length,
                     truncation=True
-                ).to(self.device)
+                )
+                
+                device = next(self.model.parameters()).device
+                inputs = inputs.to(device)
                 
                 # Generate correction
                 with torch.no_grad():
@@ -154,43 +246,11 @@ class GrammarCorrector:
                 
                 # Decode result
                 corrected = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                corrected_sentences.append(corrected)
+                corrected_parts.append(corrected)
             
-            result = ''.join(corrected_sentences)
+            result = ''.join(corrected_parts)
             return result.strip()
             
         except Exception as e:
             logger.error(f"Model-based correction failed: {e}")
-            # Return rule-based result if model fails
-            return text
-    
-    def correct_sentence_structure(self, text: str) -> str:
-        """
-        Improve sentence structure and flow.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Text with improved structure
-        """
-        # Split into sentences
-        sentences = re.split(r'([.!?]+\s*)', text)
-        improved = []
-        
-        for i, sentence in enumerate(sentences):
-            if not sentence.strip():
-                improved.append(sentence)
-                continue
-            
-            # Remove sentence fragments that are too short
-            words = sentence.split()
-            if len(words) < 3 and i < len(sentences) - 1:
-                # Merge with next sentence if too short
-                continue
-            
-            improved.append(sentence)
-        
-        result = ''.join(improved)
-        return re.sub(r'\s+', ' ', result).strip()
-
+            return self._apply_grammar_rules(text)

@@ -72,3 +72,4 @@ build/
 htmlcov/
 .pytest_cache/
 
+.env.example
